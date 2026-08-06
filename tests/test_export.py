@@ -180,8 +180,28 @@ def test_pngseq_renumbered_and_identical(frameset_dir: Path, tmp_path: Path):
         p = out / "frames" / f"frame_{i:04d}.png"
         assert p.is_file()
         arr = np.asarray(Image.open(p).convert("RGBA"))
-        assert np.array_equal(arr, _blob_frame(i))
+        src = _blob_frame(i)
+        # El alfa y los píxeles visibles son idénticos; el RGB bajo alfa 0
+        # cambia por el alpha bleeding (color del sujeto extendido hacia fuera).
+        assert np.array_equal(arr[..., 3], src[..., 3])
+        visible = src[..., 3] > 0
+        assert np.array_equal(arr[visible], src[visible])
     assert not (out / "frames" / f"frame_{N:04d}.png").exists()
+
+
+def test_pngseq_alpha_bleeding_fills_transparent_rgb(frameset_dir: Path, tmp_path: Path):
+    """Bajo los píxeles con alfa 0, el RGB pasa a ser el del sujeto más cercano
+    (no el residuo del fondo original), para no sangrar halos con filtrado
+    bilineal en los motores."""
+    out = tmp_path / "out"
+    export_animation(frameset_dir, out, formats=["pngseq"])
+    src = _blob_frame(0)
+    arr = np.asarray(Image.open(out / "frames" / "frame_0000.png").convert("RGBA"))
+    transparent = src[..., 3] == 0
+    assert transparent.any()
+    subject_rgbs = {tuple(px) for px in src[src[..., 3] > 0][:, :3]}
+    bled = arr[transparent][:, :3]
+    assert all(tuple(px) in subject_rgbs for px in bled)
 
 
 # ---------------------------------------------------------------------- gif

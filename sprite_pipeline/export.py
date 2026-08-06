@@ -36,6 +36,7 @@ import json
 import math
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -103,7 +104,7 @@ def export_animation(
             f" cuadros)); llegó {columns!r}"
         )
 
-    arrays = [load_frame_rgba(frameset_dir, f) for f in fs.frames]
+    arrays = [_bleed_rgb(load_frame_rgba(frameset_dir, f)) for f in fs.frames]
     if scale > 1:
         arrays = [_scale_nearest(a, scale) for a in arrays]
     durations = [int(f.duration_ms) for f in fs.frames]
@@ -152,6 +153,34 @@ def export_animation(
 
 
 # ----------------------------------------------------------------- helpers
+
+def _bleed_rgb(rgba: np.ndarray) -> np.ndarray:
+    """Alpha bleeding: extiende el color del sujeto bajo los píxeles con alfa 0.
+
+    Los motores con filtrado bilineal muestrean el RGB de píxeles transparentes
+    vecinos al borde del sprite; si ese RGB conserva el fondo original del
+    video, el sprite sangra un halo de ese color. Rellenar el RGB de cada píxel
+    transparente con el del píxel no-transparente más cercano elimina el
+    problema sin alterar el canal alfa.
+    """
+    alpha = rgba[..., 3]
+    transparent = alpha == 0
+    if not transparent.any() or transparent.all():
+        return rgba
+    # distanceTransformWithLabels: los píxeles con valor 0 de la entrada actúan
+    # como semillas (aquí, los no-transparentes) y cada píxel recibe la etiqueta
+    # de su semilla más cercana, enumeradas en orden raster.
+    _, labels = cv2.distanceTransformWithLabels(
+        transparent.astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
+    )
+    seeds = np.argwhere(~transparent)
+    nearest = seeds[labels - 1]
+    out = rgba.copy()
+    ys, xs = np.nonzero(transparent)
+    ny, nx = nearest[ys, xs, 0], nearest[ys, xs, 1]
+    out[ys, xs, :3] = rgba[ny, nx, :3]
+    return out
+
 
 def _scale_nearest(arr: np.ndarray, scale: int) -> np.ndarray:
     """Reescala un cuadro RGBA con vecino más cercano (sprites nítidos)."""
