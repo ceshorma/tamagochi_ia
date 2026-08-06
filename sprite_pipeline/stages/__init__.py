@@ -1,6 +1,7 @@
 """Etapas de procesamiento del pipeline.
 
-Importar este paquete registra todas las etapas disponibles en STAGE_REGISTRY.
+Las etapas se registran de forma perezosa: ``get_stage(name)`` importa
+``sprite_pipeline.stages.<name>`` bajo demanda (ver ``base.get_stage``).
 """
 
 from sprite_pipeline.stages.base import (  # noqa: F401
@@ -11,13 +12,4 @@ from sprite_pipeline.stages.base import (  # noqa: F401
     register_stage,
     run_stage,
     save_frame_rgba,
-)
-
-# Importa los módulos de etapas para que se registren.
-from sprite_pipeline.stages import (  # noqa: F401,E402
-    preprocess,
-    background,
-    align,
-    anomaly,
-    smooth,
 )

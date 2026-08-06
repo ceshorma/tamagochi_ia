@@ -69,6 +69,14 @@ def register_provider(cls: type[VideoGenerationProvider]) -> type[VideoGeneratio
 
 
 def get_provider(name: str, **kwargs) -> VideoGenerationProvider:
+    if name not in PROVIDER_REGISTRY:
+        # Registro perezoso: el módulo del proveedor se importa bajo demanda.
+        import importlib
+
+        try:
+            importlib.import_module(f"sprite_pipeline.providers.{name}")
+        except ModuleNotFoundError:
+            pass
     try:
         cls = PROVIDER_REGISTRY[name]
     except KeyError:

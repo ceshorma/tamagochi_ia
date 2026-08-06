@@ -1,6 +1,7 @@
 """Proveedores de generación de video (interfaz adaptadora desacoplada).
 
-Importar este paquete registra los proveedores disponibles en PROVIDER_REGISTRY.
+Los proveedores se registran de forma perezosa: ``get_provider(name)`` importa
+``sprite_pipeline.providers.<name>`` bajo demanda (ver ``base.get_provider``).
 """
 
 from sprite_pipeline.providers.base import (  # noqa: F401
@@ -12,5 +13,3 @@ from sprite_pipeline.providers.base import (  # noqa: F401
     get_provider,
     register_provider,
 )
-
-from sprite_pipeline.providers import mock, runway, luma  # noqa: F401,E402

@@ -49,6 +49,14 @@ def register_stage(stage_cls: type[Stage]) -> type[Stage]:
 
 
 def get_stage(name: str) -> Stage:
+    if name not in STAGE_REGISTRY:
+        # Registro perezoso: el módulo de la etapa se importa bajo demanda.
+        import importlib
+
+        try:
+            importlib.import_module(f"sprite_pipeline.stages.{name}")
+        except ModuleNotFoundError:
+            pass
     try:
         return STAGE_REGISTRY[name]
     except KeyError:
