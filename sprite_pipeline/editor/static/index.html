@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sprite Editor</title>
+  <link rel="stylesheet" href="/editor/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="anim-info">
+    <h1 id="anim-name">Cargando&hellip;</h1>
+    <span id="anim-action" class="chip chip-action" hidden></span>
+    <span id="anim-status" class="chip chip-status" data-status="">&mdash;</span>
+  </div>
+  <div class="topbar-actions">
+    <button id="btn-undo" class="btn" type="button" title="Deshacer la última edición">&#10226; Deshacer</button>
+    <button id="btn-export" class="btn btn-accent" type="button" title="Exportar animación">&#8681; Exportar</button>
+  </div>
+</header>
+
+<main class="workspace">
+
+  <section class="preview-panel">
+    <div class="preview-wrap">
+      <canvas id="preview-canvas" class="checkerboard" width="256" height="256"></canvas>
+    </div>
+    <div class="preview-controls">
+      <button id="btn-play" class="btn btn-round" type="button" title="Play / pausa">&#10074;&#10074;</button>
+      <label class="speed-label" for="speed-slider">
+        <span>Velocidad <b id="speed-value">1x</b></span>
+        <input id="speed-slider" type="range" min="0.25" max="2" step="0.25" value="1">
+      </label>
+      <span id="frame-counter" class="frame-counter" title="Cuadro actual / total">0 / 0</span>
+    </div>
+  </section>
+
+  <section class="frame-actions" aria-label="Acciones del cuadro seleccionado">
+    <span class="frame-actions-label">Cuadro <b id="selected-label">&mdash;</b></span>
+    <div class="frame-actions-buttons">
+      <button id="btn-delete" class="btn btn-danger" type="button" disabled>Eliminar</button>
+      <button id="btn-duplicate" class="btn" type="button" disabled>Duplicar</button>
+      <button id="btn-interpolate" class="btn" type="button" disabled>Interpolar después</button>
+      <button id="btn-retouch" class="btn" type="button" disabled>Retocar</button>
+    </div>
+  </section>
+
+  <section class="timeline-panel">
+    <div id="timeline" class="timeline" aria-label="Timeline de cuadros"></div>
+  </section>
+
+</main>
+
+<!-- Modal de retoque -->
+<div id="retouch-modal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-box retouch-box">
+    <h2>Retocar cuadro <span id="retouch-index">0</span></h2>
+    <p class="hint">Pinta en rojo la zona a regenerar. Al aplicar se envía la máscara (blanco = regenerar).</p>
+    <div class="retouch-canvas-wrap checkerboard">
+      <canvas id="retouch-canvas" width="512" height="512"></canvas>
+    </div>
+    <div class="retouch-controls">
+      <label class="brush-label" for="brush-radius">
+        <span>Pincel</span>
+        <input id="brush-radius" type="range" min="4" max="64" step="1" value="18">
+        <b id="brush-radius-value">18 px</b>
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button id="btn-mask-clear" class="btn" type="button">Limpiar</button>
+      <span class="spacer"></span>
+      <button id="btn-mask-cancel" class="btn btn-ghost" type="button">Cancelar</button>
+      <button id="btn-mask-apply" class="btn btn-accent" type="button">Aplicar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal de exportación -->
+<div id="export-modal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-box export-box">
+    <h2>Exportar animación</h2>
+    <div class="export-formats">
+      <label><input type="checkbox" name="fmt" value="sheet" checked> Spritesheet <small>(sheet.png + sheet.json)</small></label>
+      <label><input type="checkbox" name="fmt" value="pngseq" checked> Secuencia PNG</label>
+      <label><input type="checkbox" name="fmt" value="gif" checked> GIF animado</label>
+      <label><input type="checkbox" name="fmt" value="godot"> Godot SpriteFrames <small>(.tres)</small></label>
+    </div>
+    <div class="modal-actions">
+      <span class="spacer"></span>
+      <button id="btn-export-close" class="btn btn-ghost" type="button">Cerrar</button>
+      <button id="btn-do-export" class="btn btn-accent" type="button">Exportar</button>
+    </div>
+    <div id="export-result" class="export-result" hidden></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+<script src="/editor/static/app.js"></script>
+</body>
+</html>
