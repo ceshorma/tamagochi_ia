@@ -76,6 +76,45 @@ def test_invalid_args(frameset_dir: Path, tmp_path: Path):
         export_animation(frameset_dir, tmp_path / "c", scale=1.5)  # type: ignore[arg-type]
 
 
+def test_out_of_range_params_raise_valueerror(frameset_dir: Path, tmp_path: Path):
+    """Cotas superiores anti-OOM: columns/scale/padding fuera de rango -> ValueError."""
+    # columns: máximo max(64, nº de cuadros) = 64 con N=5
+    with pytest.raises(ValueError, match="columns"):
+        export_animation(frameset_dir, tmp_path / "a", formats=["sheet"], columns=100000)
+    with pytest.raises(ValueError, match="columns"):
+        export_animation(frameset_dir, tmp_path / "b", formats=["sheet"], columns=65)
+    with pytest.raises(ValueError, match="columns"):
+        export_animation(frameset_dir, tmp_path / "c", formats=["sheet"], columns=0)
+    # scale: 1..8
+    with pytest.raises(ValueError, match="scale"):
+        export_animation(frameset_dir, tmp_path / "d", formats=["sheet"], scale=9)
+    with pytest.raises(ValueError, match="scale"):
+        export_animation(frameset_dir, tmp_path / "e", formats=["sheet"], scale=99)
+    # padding: 0..64 (y entero)
+    with pytest.raises(ValueError, match="padding"):
+        export_animation(frameset_dir, tmp_path / "f", formats=["sheet"], padding=65)
+    with pytest.raises(ValueError, match="padding"):
+        export_animation(frameset_dir, tmp_path / "g", formats=["sheet"], padding=10**9)
+    with pytest.raises(ValueError, match="padding"):
+        export_animation(frameset_dir, tmp_path / "h", formats=["sheet"], padding=-1)
+    # nada fuera de rango escribió artefactos
+    for sub in "abcdefgh":
+        assert not (tmp_path / sub).exists()
+
+
+def test_boundary_params_ok(frameset_dir: Path, tmp_path: Path):
+    """Los valores frontera (columns=64, padding=64, scale=8) sí se aceptan."""
+    out = tmp_path / "cols64"
+    res = export_animation(frameset_dir, out, formats=["sheet"], columns=64, padding=0)
+    assert res["sheet"]["columns"] == 64
+    assert (out / "sheet.png").is_file()
+
+    out2 = tmp_path / "pad-scale"
+    res2 = export_animation(frameset_dir, out2, formats=["sheet"], padding=64, scale=8)
+    cell = SIZE * 8 + 64
+    assert res2["sheet"] == {"columns": COLS, "cell": [cell, cell], "count": N}
+
+
 # -------------------------------------------------------------------- sheet
 
 def test_sheet_png_dimensions_and_cells(frameset_dir: Path, tmp_path: Path):

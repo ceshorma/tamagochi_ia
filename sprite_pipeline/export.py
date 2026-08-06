@@ -15,9 +15,15 @@
   AtlasTexture por región sobre ``sheet.png``). Pedir ``godot`` genera el
   sheet aunque ``sheet`` no esté en ``formats``.
 
-``scale`` (entero >= 1) reescala los cuadros con ``PIL.Image.NEAREST`` para
+``scale`` (entero 1..8) reescala los cuadros con ``PIL.Image.NEAREST`` para
 mantener los sprites nítidos. Las celdas del sheet miden
 ``max(ancho), max(alto)`` de los cuadros (ya escalados) más ``padding``.
+
+Los parámetros se validan al inicio y lanzan ``ValueError`` fuera de rango
+(cotas anti-OOM): ``columns`` debe ser ``None`` o un entero en
+``1..max(64, nº de cuadros)``, ``padding`` un entero en ``0..64`` y ``scale``
+un entero en ``1..8``; los formatos fuera de ``KNOWN_FORMATS`` también lanzan
+``ValueError``.
 
 Devuelve ``{"files": [rutas relativas a out_dir],
 "sheet": {"columns": ..., "cell": [w, h], "count": n}}`` (``sheet`` es
@@ -38,6 +44,13 @@ from sprite_pipeline.stages.base import load_frame_rgba, save_frame_rgba
 
 DEFAULT_FORMATS = ("sheet", "pngseq", "gif")
 KNOWN_FORMATS = frozenset({"sheet", "pngseq", "gif", "godot"})
+
+#: Cotas superiores de los parámetros de export (anti-OOM: la memoria del
+#: sheet crece con columns*padding y la de cada cuadro con scale²).
+MAX_SCALE = 8
+MAX_PADDING = 64
+#: ``columns`` admite como máximo ``max(MAX_COLUMNS_FLOOR, nº de cuadros)``.
+MAX_COLUMNS_FLOOR = 64
 
 #: Color de fondo del fallback del GIF (y base de composición de semialfas).
 GIF_FALLBACK_BG = (0x2B, 0x2B, 0x2B)
@@ -63,16 +76,32 @@ def export_animation(
         raise ValueError(
             f"Formatos desconocidos: {unknown}. Soportados: {sorted(KNOWN_FORMATS)}"
         )
-    if isinstance(scale, bool) or not isinstance(scale, int) or scale < 1:
-        raise ValueError(f"scale debe ser un entero >= 1; llegó {scale!r}")
-    if padding < 0:
-        raise ValueError(f"padding debe ser >= 0; llegó {padding!r}")
-    if columns is not None and columns < 1:
-        raise ValueError(f"columns debe ser >= 1; llegó {columns!r}")
+    if isinstance(scale, bool) or not isinstance(scale, int) or not 1 <= scale <= MAX_SCALE:
+        raise ValueError(
+            f"scale debe ser un entero entre 1 y {MAX_SCALE}; llegó {scale!r}"
+        )
+    if (
+        isinstance(padding, bool)
+        or not isinstance(padding, int)
+        or not 0 <= padding <= MAX_PADDING
+    ):
+        raise ValueError(
+            f"padding debe ser un entero entre 0 y {MAX_PADDING}; llegó {padding!r}"
+        )
+    if columns is not None and (
+        isinstance(columns, bool) or not isinstance(columns, int) or columns < 1
+    ):
+        raise ValueError(f"columns debe ser None o un entero >= 1; llegó {columns!r}")
 
     fs = FrameSet.load(frameset_dir)
     if not fs.frames:
         raise ValueError(f"FrameSet sin cuadros en {frameset_dir}")
+    max_columns = max(MAX_COLUMNS_FLOOR, len(fs.frames))
+    if columns is not None and columns > max_columns:
+        raise ValueError(
+            f"columns debe ser <= {max_columns} (max({MAX_COLUMNS_FLOOR}, nº de"
+            f" cuadros)); llegó {columns!r}"
+        )
 
     arrays = [load_frame_rgba(frameset_dir, f) for f in fs.frames]
     if scale > 1:

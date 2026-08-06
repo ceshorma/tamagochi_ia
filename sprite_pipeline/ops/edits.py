@@ -11,20 +11,38 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from sprite_pipeline.models import Frame, FrameSet, frame_filename
+from sprite_pipeline.models import MANIFEST_NAME, Frame, FrameSet, frame_filename
 from sprite_pipeline.ops.interpolate import interpolate_frames
 from sprite_pipeline.ops.retouch import retouch_region
 from sprite_pipeline.stages.base import load_frame_rgba, save_frame_rgba
 from sprite_pipeline.storage import Paths
 
 VALID_OPS = ("delete", "duplicate", "reorder", "set_duration", "interpolate", "retouch")
+
+#: Un lock por animación (keyed por ``str(paths.animation_dir)``): serializa
+#: ensure_edit_session / apply_edit / undo entre hilos (los endpoints FastAPI
+#: síncronos corren en threadpool, así que hay concurrencia real).
+_ANIM_LOCKS: dict[str, threading.RLock] = {}
+_ANIM_LOCKS_GUARD = threading.Lock()
+
+
+def _animation_lock(paths: Paths) -> threading.RLock:
+    key = str(paths.animation_dir)
+    with _ANIM_LOCKS_GUARD:
+        lock = _ANIM_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _ANIM_LOCKS[key] = lock
+        return lock
 
 
 # --------------------------------------------------------------------- helpers
@@ -75,54 +93,86 @@ def _renumber_files(fs: FrameSet, directory: Path) -> None:
 def ensure_edit_session(paths: Paths) -> Path:
     """Devuelve el dir de la versión de edición actual, creándola si no existe.
 
-    Sin ediciones previas copia el último stage dir a ``edit_0001``.
+    Sin ediciones previas (válidas) copia el último stage dir COMPLETO a una
+    versión nueva. La copia se hace a un nombre temporal y se renombra de forma
+    atómica, de modo que nunca queda una versión parcial sin manifiesto.
     """
-    versions = paths.list_edit_versions()
-    if versions:
-        return paths.edit_dir(versions[-1])
-    src = paths.latest_stage_dir()
-    if src is None:
-        raise FileNotFoundError("No hay etapas procesadas para esta animación: nada que editar")
-    dst = paths.edit_dir(1)
-    shutil.copytree(src, dst)
-    return dst
+    with _animation_lock(paths):
+        versions = paths.list_edit_versions()
+        if versions:
+            return paths.edit_dir(versions[-1])
+        src = paths.latest_stage_dir()
+        if src is None:
+            raise FileNotFoundError(
+                "No hay etapas procesadas para esta animación: nada que editar"
+            )
+        if not (src / MANIFEST_NAME).exists():
+            raise FileNotFoundError(
+                "La animación aún se está procesando (etapa sin manifiesto): "
+                "no se puede editar todavía"
+            )
+        dst = paths.edit_dir(paths.next_edit_version())
+        tmp = dst.with_name(dst.name + ".tmp")
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        try:
+            shutil.copytree(src, tmp)
+            os.replace(tmp, dst)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        return dst
 
 
 def undo(paths: Paths) -> FrameSet | None:
-    """Borra la última versión de edición si hay más de una; devuelve la anterior."""
-    versions = paths.list_edit_versions()
-    if len(versions) <= 1:
-        return None
-    shutil.rmtree(paths.edit_dir(versions[-1]))
-    return FrameSet.load(paths.edit_dir(versions[-2]))
+    """Borra la última versión de edición si hay más de una; devuelve la anterior.
+
+    Solo cuenta versiones válidas (con manifiesto): las copias parciales que
+    hubiera dejado un fallo previo se ignoran.
+    """
+    with _animation_lock(paths):
+        versions = paths.list_edit_versions()
+        if len(versions) <= 1:
+            return None
+        shutil.rmtree(paths.edit_dir(versions[-1]))
+        return FrameSet.load(paths.edit_dir(versions[-2]))
 
 
 # -------------------------------------------------------------------- apply_edit
 
 def apply_edit(paths: Paths, op: dict) -> FrameSet:
-    """Crea ``edit_{n+1}`` (copia física de la versión actual) y aplica ``op``."""
+    """Crea ``edit_{n+1}`` (copia física de la versión actual) y aplica ``op``.
+
+    La versión nueva se construye en un dir temporal y solo se renombra al
+    nombre final tras guardar el manifiesto: ante cualquier fallo el temporal
+    se limpia y el historial de versiones queda intacto.
+    """
     if not isinstance(op, dict) or "op" not in op:
         raise ValueError("La operación debe ser un dict con clave 'op'")
     name = op["op"]
     if name not in VALID_OPS:
         raise ValueError(f"Operación desconocida: {name!r}. Válidas: {list(VALID_OPS)}")
 
-    current = ensure_edit_session(paths)
-    version = paths.list_edit_versions()[-1] + 1
-    new_dir = paths.edit_dir(version)
-    shutil.copytree(current, new_dir)
-    try:
-        fs = FrameSet.load(new_dir)
-        _OP_HANDLERS[name](fs, new_dir, op)
-        _renumber_files(fs, new_dir)
-        params = {k: v for k, v in op.items() if k != "mask_png_base64"}
-        fs.history = [*fs.history, {"stage": "edit", "params": params, "at": _now()}]
-        fs.stage = "edit"
-        fs.save(new_dir)
-        return fs
-    except Exception:
-        shutil.rmtree(new_dir, ignore_errors=True)
-        raise
+    with _animation_lock(paths):
+        current = ensure_edit_session(paths)
+        new_dir = paths.edit_dir(paths.next_edit_version())
+        tmp_dir = new_dir.with_name(new_dir.name + ".tmp")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        try:
+            shutil.copytree(current, tmp_dir)
+            fs = FrameSet.load(tmp_dir)
+            _OP_HANDLERS[name](fs, tmp_dir, op)
+            _renumber_files(fs, tmp_dir)
+            params = {k: v for k, v in op.items() if k != "mask_png_base64"}
+            fs.history = [*fs.history, {"stage": "edit", "params": params, "at": _now()}]
+            fs.stage = "edit"
+            fs.save(tmp_dir)
+            os.replace(tmp_dir, new_dir)
+            return fs
+        except Exception:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
 
 
 # ------------------------------------------------------------------ operaciones

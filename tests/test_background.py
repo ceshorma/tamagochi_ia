@@ -146,6 +146,57 @@ def test_works_without_meta_bg_estimate(tmp_path):
         assert abs(int((alpha > 128).sum()) - expected) <= 0.15 * expected
 
 
+def test_edge_band_decontaminated_no_bg_halo(tmp_path):
+    """La banda semitransparente del borde no conserva el halo del fondo.
+
+    Regresión: antes el feather regalaba alfa a un anillo FUERA de la silueta
+    cuyo RGB era el color del fondo del video, horneando un fleco del color
+    del fondo en el sprite. Ahora el feather es solo hacia adentro y el RGB de
+    la banda 0<alfa<255 se des-mezcla del color de fondo estimado: todo píxel
+    del borde queda más cerca del color del sujeto que del fondo original."""
+    subject = np.array([30, 120, 40], dtype=np.float32)
+    bg = np.array([220, 220, 230], dtype=np.float32)
+    side = 60
+
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    in_dir.mkdir(parents=True)
+    frames: list[Frame] = []
+    tops: list[int] = []
+    for i in range(3):
+        arr = np.zeros((SIZE, SIZE, 4), np.uint8)
+        arr[..., :3] = bg.astype(np.uint8)
+        arr[..., 3] = 255
+        y0 = 30 + i  # leve movimiento vertical entre cuadros
+        arr[y0:y0 + side, 30:30 + side, :3] = subject.astype(np.uint8)
+        fname = frame_filename(i)
+        save_frame_rgba(in_dir, fname, arr)
+        frames.append(Frame(index=i, file=fname))
+        tops.append(y0)
+    FrameSet(stage="preprocess", frames=frames, meta={"size": [SIZE, SIZE]}).save(in_dir)
+
+    fs_out = run_stage(get_stage("background"), in_dir, out_dir)
+
+    for frame, y0 in zip(fs_out.frames, tops):
+        rgba = load_frame_rgba(out_dir, frame)
+        alpha = rgba[..., 3]
+
+        # Fuera de la silueta verdadera no se regala alfa (sin anillo exterior).
+        outside = np.ones((SIZE, SIZE), dtype=bool)
+        outside[y0:y0 + side, 30:30 + side] = False
+        assert (alpha[outside] == 0).all()
+
+        # La banda 0<alfa<255 existe y su RGB tiende al sujeto, no al fondo.
+        semi = (alpha > 0) & (alpha < 255)
+        assert semi.any()
+        rgb = rgba[..., :3].astype(np.float32)
+        dist_subject = np.linalg.norm(rgb[semi] - subject, axis=1)
+        dist_bg = np.linalg.norm(rgb[semi] - bg, axis=1)
+        assert (dist_subject < dist_bg).all(), (
+            f"halo: {int((dist_subject >= dist_bg).sum())} píxeles del borde "
+            "siguen más cerca del color del fondo original"
+        )
+
+
 def test_unavailable_method_raises_value_error(tmp_path):
     in_dir = tmp_path / "in"
     _make_sequence(in_dir, n=2)

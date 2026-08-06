@@ -12,11 +12,18 @@ construyen por request; nunca se cachean globalmente.
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from PIL import Image
+from starlette.background import BackgroundTask
 
+from sprite_pipeline import orchestrator as orchestrator_module
 from sprite_pipeline.config import get_settings
 from sprite_pipeline.export import export_animation
 from sprite_pipeline.models import MANIFEST_NAME, FrameSet
@@ -26,6 +33,17 @@ from sprite_pipeline.storage import Paths, Store, new_id
 
 #: Directorio de assets del editor dentro del paquete.
 STATIC_DIR = Path(__file__).resolve().parents[1] / "editor" / "static"
+
+#: Tope de tamaño de la imagen subida (bytes). Excedido -> HTTP 413.
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+#: Lado máximo (px) de la imagen subida. Excedido -> HTTP 400.
+MAX_IMAGE_SIDE = 4096
+#: Tamaño de chunk al leer la subida (nunca se materializa entera en memoria).
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+#: Estados de animación con el pipeline en curso: las mutaciones (edits/undo/
+#: export) se rechazan con HTTP 409 mientras dure.
+BUSY_STATUSES = ("generating", "processing")
 
 
 # ------------------------------------------------------------------ helpers
@@ -44,6 +62,58 @@ def _check_relpath(path: str) -> str:
     if any(part in ("", ".", "..") for part in path.split("/")):
         raise HTTPException(status_code=400, detail=f"Ruta inválida: {path!r}")
     return path
+
+
+async def _receive_upload(file: UploadFile, dest: Path) -> None:
+    """Escribe la subida en ``dest`` por chunks y la valida como imagen.
+
+    - Más de ``MAX_UPLOAD_BYTES`` -> 413 (se aborta sin leer el resto y sin
+      cargar el archivo completo en memoria).
+    - No decodificable por PIL -> 400.
+    - Lado mayor que ``MAX_IMAGE_SIDE`` px -> 400.
+
+    Ante cualquier fallo se elimina ``dest``.
+    """
+    size = 0
+    try:
+        with dest.open("wb") as out:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "Archivo demasiado grande "
+                            f"(máximo {MAX_UPLOAD_BYTES} bytes)"
+                        ),
+                    )
+                out.write(chunk)
+        try:
+            # verify() detecta archivos truncados/corruptos pero invalida el
+            # objeto: se re-abre para leer las dimensiones.
+            with Image.open(dest) as img:
+                img.verify()
+            with Image.open(dest) as img:
+                width, height = img.size
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="El archivo subido no es una imagen válida",
+            ) from exc
+        if max(width, height) > MAX_IMAGE_SIDE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Imagen demasiado grande: {width}x{height} px "
+                    f"(lado máximo {MAX_IMAGE_SIDE} px)"
+                ),
+            )
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
 
 
 def _load_manifest(directory: Path) -> dict:
@@ -92,7 +162,18 @@ def _resolve_frameset_dir(paths: Paths, version: str) -> Path:
 
 def create_app(store: Store | None = None) -> FastAPI:
     """Crea la aplicación FastAPI. ``store`` inyectable para tests."""
-    app = FastAPI(title="AI Sprite Pipeline API")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # Jobs/animaciones que quedaron 'queued'/'running'/'processing' por un
+        # reinicio: el executor es solo memoria, así que se reconcilian al
+        # arrancar. getattr tolerante: no-op si la función aún no existe.
+        reconcile = getattr(orchestrator_module, "reconcile_stale_jobs", None)
+        if reconcile is not None:
+            reconcile(get_store())
+        yield
+
+    app = FastAPI(title="AI Sprite Pipeline API", lifespan=lifespan)
     app.state.injected_store = store
     app.state.default_store = None
 
@@ -117,6 +198,19 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     def _paths_for(anim: dict) -> Paths:
         return Paths(anim["project_id"], anim["id"])
+
+    def _reject_if_busy(anim: dict) -> None:
+        """409 si el pipeline de la animación sigue corriendo (ver BUSY_STATUSES)."""
+        status = anim.get("status")
+        if status in BUSY_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"La animación {anim['id']} está '{status}': el pipeline "
+                    "sigue corriendo; espera a que termine (status 'ready') "
+                    "antes de editar, deshacer o exportar"
+                ),
+            )
 
     # ----------------------------------------------------------------- health
 
@@ -176,18 +270,29 @@ def create_app(store: Store | None = None) -> FastAPI:
         if seed is not None:
             gen_params["seed"] = seed
 
-        anim = store.create_animation(
-            pid, name, action, provider or settings.provider, params=json.dumps(gen_params)
-        )
-        paths = Paths(pid, anim["id"])
-
-        # Imagen subida a un tmp dentro del dir de la animación; el
-        # orquestador la copia luego a source.png.
-        tmp_dir = paths.animation_dir / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
+        # La subida se recibe y valida (tope de bytes -> 413, imagen PIL
+        # decodificable y lado <= MAX_IMAGE_SIDE -> 400) ANTES de crear la
+        # animación, en un dir temporal propio del request.
         suffix = Path(file.filename or "upload.png").suffix or ".png"
-        tmp_path = tmp_dir / f"upload{suffix}"
-        tmp_path.write_bytes(await file.read())
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        upload_dir = Path(tempfile.mkdtemp(prefix="upload-", dir=settings.data_dir))
+        try:
+            upload_tmp = upload_dir / f"upload{suffix}"
+            await _receive_upload(file, upload_tmp)
+
+            anim = store.create_animation(
+                pid, name, action, provider or settings.provider, params=json.dumps(gen_params)
+            )
+            paths = Paths(pid, anim["id"])
+
+            # Imagen subida a un tmp dentro del dir de la animación; el
+            # orquestador la copia luego a source.png.
+            tmp_dir = paths.animation_dir / "tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = tmp_dir / f"upload{suffix}"
+            shutil.move(str(upload_tmp), tmp_path)
+        finally:
+            shutil.rmtree(upload_dir, ignore_errors=True)
 
         if sync:
             job = store.create_job(anim["id"], kind="pipeline")
@@ -258,6 +363,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         store: Store = Depends(get_store),
     ) -> dict:
         anim = _anim_or_404(store, aid)
+        _reject_if_busy(anim)
         paths = _paths_for(anim)
         try:
             edit_ops.ensure_edit_session(paths)
@@ -271,6 +377,7 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.post("/api/animations/{aid}/undo")
     def post_undo(aid: str, store: Store = Depends(get_store)) -> dict:
         anim = _anim_or_404(store, aid)
+        _reject_if_busy(anim)
         paths = _paths_for(anim)
         fs = edit_ops.undo(paths)
         if fs is not None:
@@ -294,12 +401,20 @@ def create_app(store: Store | None = None) -> FastAPI:
         anim = _anim_or_404(store, aid)
         paths = _paths_for(anim)
         directory = _resolve_frameset_dir(paths, version)
-        cache_dir = paths.animation_dir / "preview_cache"
+        # Subdir único por request: dos requests concurrentes (o de versiones
+        # distintas) nunca escriben/sirven el mismo archivo. Se limpia tras
+        # enviar la respuesta (BackgroundTask del FileResponse).
+        cache_dir = paths.animation_dir / "preview_cache" / uuid.uuid4().hex
         try:
             export_animation(directory, cache_dir, formats=["gif"])
         except ValueError as exc:
+            shutil.rmtree(cache_dir, ignore_errors=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return FileResponse(cache_dir / "preview.gif", media_type="image/gif")
+        return FileResponse(
+            cache_dir / "preview.gif",
+            media_type="image/gif",
+            background=BackgroundTask(shutil.rmtree, cache_dir, ignore_errors=True),
+        )
 
     @app.post("/api/animations/{aid}/export")
     def post_export(
@@ -308,6 +423,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         store: Store = Depends(get_store),
     ) -> dict:
         anim = _anim_or_404(store, aid)
+        _reject_if_busy(anim)
         paths = _paths_for(anim)
         payload = payload or {}
         working = paths.working_dir()

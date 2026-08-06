@@ -8,7 +8,9 @@ proveedor mock -> etapas se ejerce una sola vez con ``?sync=1``.
 
 from __future__ import annotations
 
+import io
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -172,6 +174,54 @@ def test_pipeline_sync_full_flow(client: TestClient, sample_image: Path):
     assert client.get(f"/api/animations/{aid}/frames/raro..nombre.png").status_code == 400
 
 
+# ------------------------------------------------------- validación de subidas
+
+def _post_animation(client: TestClient, pid: str, content: bytes, name: str = "up.png"):
+    return client.post(
+        f"/api/projects/{pid}/animations",
+        files={"file": (name, io.BytesIO(content), "image/png")},
+        data={"name": "x", "action": "idle", "provider": "mock"},
+    )
+
+
+def test_upload_no_imagen_400(client: TestClient):
+    """Un archivo que PIL no decodifica se rechaza con 400 y no crea nada."""
+    pid = client.post("/api/projects", json={"name": "subidas"}).json()["id"]
+    r = _post_animation(client, pid, b"esto no es una imagen valida" * 64)
+    assert r.status_code == 400
+    assert "imagen" in r.json()["detail"]
+    # no quedó ninguna animación huérfana
+    assert client.get(f"/api/projects/{pid}/animations").json() == []
+
+
+def test_upload_gigante_413(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """Subida que excede el tope de bytes -> 413 (tope bajado por monkeypatch)."""
+    import sprite_pipeline.api.app as app_module
+
+    monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 1024)
+    pid = client.post("/api/projects", json={"name": "subidas"}).json()["id"]
+    payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8192  # > 1024 bytes
+    r = _post_animation(client, pid, payload, name="grande.png")
+    assert r.status_code == 413
+    assert client.get(f"/api/projects/{pid}/animations").json() == []
+
+
+def test_upload_dimensiones_excesivas_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Imagen válida pero con lado mayor al máximo -> 400 (límite por monkeypatch)."""
+    import sprite_pipeline.api.app as app_module
+
+    monkeypatch.setattr(app_module, "MAX_IMAGE_SIDE", 64)
+    pid = client.post("/api/projects", json={"name": "subidas"}).json()["id"]
+    buf = io.BytesIO()
+    Image.new("RGBA", (128, 128), (255, 0, 0, 255)).save(buf, format="PNG")
+    r = _post_animation(client, pid, buf.getvalue())
+    assert r.status_code == 400
+    assert "px" in r.json()["detail"]
+    assert client.get(f"/api/projects/{pid}/animations").json() == []
+
+
 # ---------------------------------------------------------------------- edits
 
 def test_edits_y_undo(client: TestClient, store: Store):
@@ -258,6 +308,29 @@ def test_edits_errores(client: TestClient, store: Store):
     assert len(r.json()["frames"]) == 3
 
 
+def test_mutaciones_409_mientras_corre_el_pipeline(client: TestClient, store: Store):
+    """edits/undo/export -> 409 con detail claro si el pipeline sigue corriendo."""
+    aid = _synthetic_animation(store, n=3)
+    for status in ("generating", "processing"):
+        store.update_animation(aid, status=status)
+        r = client.post(f"/api/animations/{aid}/edits", json={"op": "delete", "index": 0})
+        assert r.status_code == 409, r.text
+        assert status in r.json()["detail"]
+        r = client.post(f"/api/animations/{aid}/undo")
+        assert r.status_code == 409
+        assert status in r.json()["detail"]
+        r = client.post(f"/api/animations/{aid}/export", json={"formats": ["sheet"]})
+        assert r.status_code == 409
+        assert status in r.json()["detail"]
+    # nada mutó mientras estaba ocupado: siguen los 3 cuadros originales
+    assert len(_get_frameset(client, aid, "working")["frames"]) == 3
+    # al quedar 'ready' las mutaciones vuelven a aceptarse
+    store.update_animation(aid, status="ready")
+    r = client.post(f"/api/animations/{aid}/edits", json={"op": "delete", "index": 0})
+    assert r.status_code == 200, r.text
+    assert len(r.json()["frames"]) == 2
+
+
 # ------------------------------------------------------------ preview / export
 
 def test_preview_gif(client: TestClient, store: Store):
@@ -267,6 +340,40 @@ def test_preview_gif(client: TestClient, store: Store):
     assert r.headers["content-type"] == "image/gif"
     assert r.content.startswith(b"GIF8")
     assert client.get("/api/animations/zzz/preview.gif").status_code == 404
+
+
+def test_preview_gif_concurrente(client: TestClient, store: Store):
+    """Dos GET preview.gif a la vez: ambos 200, GIFs válidos y de SU versión.
+
+    Además el cache por request se limpia tras servir: sin el fix (ruta
+    compartida ``preview_cache/preview.gif``) quedaría un archivo persistente
+    mutable entre requests.
+    """
+    aid = _synthetic_animation(store, n=4)
+    # una edición para que 'working' (3 cuadros) difiera de 'preprocess' (4)
+    r = client.post(f"/api/animations/{aid}/edits", json={"op": "delete", "index": 0})
+    assert r.status_code == 200, r.text
+
+    def fetch(version: str):
+        return version, client.get(
+            f"/api/animations/{aid}/preview.gif", params={"version": version}
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        results = list(ex.map(fetch, ["working", "preprocess"]))
+
+    expected_frames = {"working": 3, "preprocess": 4}
+    for version, resp in results:
+        assert resp.status_code == 200, (version, resp.text)
+        assert resp.headers["content-type"] == "image/gif"
+        gif = Image.open(io.BytesIO(resp.content))  # PIL lo abre: GIF no corrupto
+        assert gif.n_frames == expected_frames[version], version
+
+    # nada compartido persiste: el subdir por request se limpió tras responder
+    anim = store.get_animation(aid)
+    cache_root = Paths(anim["project_id"], aid).animation_dir / "preview_cache"
+    leftovers = sorted(str(p) for p in cache_root.rglob("*")) if cache_root.exists() else []
+    assert leftovers == []
 
 
 def test_export_y_descarga(client: TestClient, store: Store):
@@ -310,6 +417,41 @@ def test_export_y_descarga(client: TestClient, store: Store):
     r = client.post(f"/api/animations/{aid}/export", json={"formats": ["exe"]})
     assert r.status_code == 400
     assert client.post("/api/animations/zzz/export", json={}).status_code == 404
+
+
+def test_export_parametros_fuera_de_rango_400(client: TestClient, store: Store):
+    """columns/scale/padding desmesurados -> 400 (nunca OOM ni 500)."""
+    aid = _synthetic_animation(store, n=4)
+    base = f"/api/animations/{aid}/export"
+
+    r = client.post(base, json={"formats": ["sheet"], "columns": 100000})
+    assert r.status_code == 400
+    assert "columns" in r.json()["detail"]
+
+    r = client.post(base, json={"formats": ["sheet"], "scale": 99})
+    assert r.status_code == 400
+    assert "scale" in r.json()["detail"]
+
+    r = client.post(base, json={"formats": ["sheet"], "padding": 10**9})
+    assert r.status_code == 400
+    assert "padding" in r.json()["detail"]
+
+
+# -------------------------------------------------------------------- startup
+
+def test_startup_llama_reconcile_stale_jobs(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+):
+    """El arranque de la app reconcilia jobs huérfanos vía el orquestador."""
+    import sprite_pipeline.orchestrator as orch
+
+    calls: list = []
+    monkeypatch.setattr(orch, "reconcile_stale_jobs", calls.append, raising=False)
+    from sprite_pipeline.api.app import create_app
+
+    with TestClient(create_app(store)):
+        pass
+    assert calls == [store]
 
 
 # --------------------------------------------------------------------- editor

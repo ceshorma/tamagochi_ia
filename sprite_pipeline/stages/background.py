@@ -12,13 +12,20 @@ Método por defecto ``"auto"``:
 4. Sujeto = complemento; morfología close+open (kernel 3) y componente(s)
    principales para eliminar motas.
 5. Alfa = máscara * 255 con el borde suavizado (GaussianBlur sigma≈1 aplicado
-   solo en la banda del borde de la silueta).
+   solo en la banda INTERIOR del borde de la silueta; fuera de la silueta el
+   alfa queda en 0, sin regalar alfa a píxeles de fondo).
+6. Decontaminación del borde: en los píxeles semitransparentes
+   (``0 < alfa < 255``) el RGB se des-mezcla del color de fondo estimado con
+   ``s = (c - (1 - a) * bg) / a`` (``a = alfa/255``, clip a 0..255), solo
+   donde ``a > 0.05``; con ``a <= 0.05`` el píxel pasa a alfa 0. Así el borde
+   no conserva un halo del color del fondo original.
 
 Consistencia temporal: los píxeles cuya distancia cae en la banda ambigua
 (``tolerance ± 10``) heredan la decisión (fondo/sujeto) del cuadro anterior,
 lo que evita el parpadeo de silueta entre cuadros.
 
-El RGB del resultado conserva el color original del sujeto.
+El RGB del resultado conserva el color original del sujeto en el interior
+opaco; solo el borde semitransparente se des-mezcla del fondo.
 
 ``params["method"]`` queda reservado para métodos futuros ("rembg", "sam2");
 pedir uno no disponible lanza ``ValueError``.
@@ -81,16 +88,50 @@ def _principal_components(mask: np.ndarray) -> np.ndarray:
 
 
 def _feathered_alpha(mask: np.ndarray) -> np.ndarray:
-    """Máscara binaria -> alfa uint8 con el borde suavizado.
+    """Máscara binaria -> alfa uint8 con el borde suavizado SOLO hacia adentro.
 
-    El GaussianBlur (sigma≈1) se aplica únicamente en la banda del borde de la
-    silueta (dilatación - erosión); el interior queda en 255 y el fondo en 0.
+    El GaussianBlur (sigma≈1) se aplica únicamente en la banda interior del
+    borde de la silueta (máscara - erosión); el interior queda en 255 y TODO
+    píxel fuera de la silueta queda en 0. Dar alfa a píxeles exteriores (cuyo
+    RGB es el fondo del video) pintaría un halo del color del fondo original.
     """
     m8 = mask.astype(np.uint8)
     m255 = m8 * 255
     blurred = cv2.GaussianBlur(m255, (0, 0), 1.0)
-    band = cv2.dilate(m8, _KERNEL3) - cv2.erode(m8, _KERNEL3)
+    band = m8 - cv2.erode(m8, _KERNEL3)
     return np.where(band > 0, blurred, m255).astype(np.uint8)
+
+
+#: Alfa mínimo (fracción) para des-mezclar el borde; por debajo -> alfa 0.
+_MIN_UNMIX_ALPHA = 0.05
+
+
+def _decontaminate_edge(rgba: np.ndarray, bg_color: np.ndarray) -> np.ndarray:
+    """Des-mezcla el color de fondo del RGB de los píxeles semitransparentes.
+
+    Modelo de composición: ``c = a*s + (1-a)*bg`` => ``s = (c - (1-a)*bg)/a``
+    con ``a = alfa/255``, recortado a 0..255. Se aplica in-place solo donde
+    ``0 < alfa < 255`` y ``a > _MIN_UNMIX_ALPHA``; los píxeles con
+    ``a <= _MIN_UNMIX_ALPHA`` pasan a alfa 0. El resultado es un borde cuyo
+    RGB tiende al color del sujeto, no al del fondo original (sin halo).
+    """
+    alpha = rgba[..., 3]
+    semi = (alpha > 0) & (alpha < 255)
+    if not semi.any():
+        return rgba
+    a = alpha.astype(np.float32) / 255.0
+    weak = semi & (a <= _MIN_UNMIX_ALPHA)
+    strong = semi & (a > _MIN_UNMIX_ALPHA)
+    if strong.any():
+        c = rgba[..., :3].astype(np.float32)
+        af = a[..., None]
+        bg = np.asarray(bg_color, dtype=np.float32).reshape(1, 1, 3)
+        s = (c - (1.0 - af) * bg) / np.maximum(af, 1e-6)
+        s = np.clip(np.rint(s), 0, 255).astype(np.uint8)
+        rgb = rgba[..., :3]
+        rgb[strong] = s[strong]
+    alpha[weak] = 0
+    return rgba
 
 
 @register_stage
@@ -139,8 +180,9 @@ class BackgroundStage(Stage):
             prev_mask = subject
 
             alpha = _feathered_alpha(subject)
-            out = rgba.copy()  # el RGB del sujeto se conserva tal cual
+            out = rgba.copy()  # el RGB del interior opaco se conserva tal cual
             out[..., 3] = np.minimum(rgba[..., 3], alpha)
+            out = _decontaminate_edge(out, bg_color)
 
             fname = frame_filename(i)
             save_frame_rgba(out_dir, fname, out)

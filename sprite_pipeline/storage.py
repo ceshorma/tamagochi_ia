@@ -16,6 +16,7 @@ Layout de datos bajo ``settings.data_dir``::
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 import time
@@ -23,6 +24,12 @@ import uuid
 from pathlib import Path
 
 from sprite_pipeline.config import get_settings
+from sprite_pipeline.models import MANIFEST_NAME
+
+#: Nombre de dir de versión de edición: ``edit_NNNN`` (exacto para versiones
+#: válidas; como prefijo para detectar basura/temporales y no reutilizar números).
+_EDIT_DIR_RE = re.compile(r"^edit_(\d+)$")
+_EDIT_DIR_PREFIX_RE = re.compile(r"^edit_(\d+)")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -167,6 +174,13 @@ class Store:
         with self._conn() as c:
             c.execute(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), jid))
 
+    def list_unfinished_jobs(self) -> list[dict]:
+        """Jobs que no llegaron a un estado terminal (``queued``/``running``)."""
+        rows = self._conn().execute(
+            "SELECT * FROM jobs WHERE status IN ('queued','running') ORDER BY created_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
 
 class Paths:
     """Rutas de artefactos de una animación."""
@@ -198,16 +212,38 @@ class Paths:
         return self.edits_dir / f"edit_{version:04d}"
 
     def list_edit_versions(self) -> list[int]:
+        """Versiones de edición VÁLIDAS: dirs ``edit_NNNN`` con ``frameset.json``.
+
+        Las copias parciales (sin manifiesto) y los dirs temporales se ignoran
+        para que nunca se elijan como versión de trabajo.
+        """
         if not self.edits_dir.exists():
             return []
         versions = []
         for d in self.edits_dir.iterdir():
-            if d.is_dir() and d.name.startswith("edit_"):
-                try:
-                    versions.append(int(d.name.split("_")[1]))
-                except (IndexError, ValueError):
-                    continue
+            if not d.is_dir():
+                continue
+            m = _EDIT_DIR_RE.match(d.name)
+            if m and (d / MANIFEST_NAME).exists():
+                versions.append(int(m.group(1)))
         return sorted(versions)
+
+    def next_edit_version(self) -> int:
+        """Siguiente número de versión libre.
+
+        Considera TODOS los dirs ``edit_*`` (válidos, parciales o temporales)
+        para no colisionar con basura dejada por fallos previos.
+        """
+        if not self.edits_dir.exists():
+            return 1
+        highest = 0
+        for d in self.edits_dir.iterdir():
+            if not d.is_dir():
+                continue
+            m = _EDIT_DIR_PREFIX_RE.match(d.name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+        return highest + 1
 
     @property
     def exports_dir(self) -> Path:
@@ -217,11 +253,22 @@ class Paths:
         return self.exports_dir / export_id
 
     def latest_stage_dir(self) -> Path | None:
-        """Directorio de etapa más avanzado que exista (ordenado por prefijo NN_)."""
+        """Directorio de etapa COMPLETO más avanzado (ordenado por prefijo NN_).
+
+        Solo cuentan los dirs con ``frameset.json``: un stage dir parcial (de
+        una etapa en curso o fallida) se salta en favor de la etapa completa
+        anterior. Los dirs temporales ``*.tmp`` se ignoran siempre.
+        """
         if not self.stages_dir.exists():
             return None
-        dirs = sorted(d for d in self.stages_dir.iterdir() if d.is_dir())
-        return dirs[-1] if dirs else None
+        dirs = sorted(
+            d for d in self.stages_dir.iterdir()
+            if d.is_dir() and not d.name.endswith(".tmp")
+        )
+        for d in reversed(dirs):
+            if (d / MANIFEST_NAME).exists():
+                return d
+        return None
 
     def working_dir(self) -> Path | None:
         """FrameSet de trabajo actual: última edición si existe, si no la última etapa."""

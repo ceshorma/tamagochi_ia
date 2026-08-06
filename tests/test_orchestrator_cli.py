@@ -112,6 +112,29 @@ def test_submit_generation_job_succeeds(data_dir: Path, sample_image: Path):
     assert store.get_animation(anim["id"])["status"] == "ready"
 
 
+def test_submit_generation_animacion_inexistente_marca_job_failed(
+    data_dir: Path, sample_image: Path
+):
+    """Una excepción ANTES del cuerpo del pipeline (animación desconocida) no
+    deja el job huérfano en queued: termina en failed con error registrado."""
+    store = Store()
+    orch = get_orchestrator(store)
+
+    job = orch.submit_generation("no-such-anim", sample_image, dict(FAST_PARAMS))
+
+    deadline = time.monotonic() + 20
+    current = store.get_job(job["id"])
+    while time.monotonic() < deadline:
+        current = store.get_job(job["id"])
+        if current["status"] in ("succeeded", "failed"):
+            break
+        time.sleep(0.05)
+
+    assert current["status"] == "failed", f"job quedó huérfano: {current}"
+    assert current["error"]
+    assert "no-such-anim" in current["error"]
+
+
 # ------------------------------------------------------------------------ CLI
 
 def test_cli_generate_and_export(

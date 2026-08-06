@@ -12,6 +12,12 @@ Scores por cuadro (todos en [0, 1]):
   ``0.6 * sim_histograma_HSV + 0.4 * sim_area_silueta``, donde el histograma
   HSV se calcula solo sobre píxeles del sujeto (alfa > 0) y se compara con
   ``cv2.compareHist(HISTCMP_CORREL)`` reescalado de [-1, 1] a [0, 1].
+  El área de silueta se compara como FRACCIÓN relativa (área del sujeto /
+  área total de SU imagen) en ambos lados, de modo que una referencia con
+  resolución distinta a la de los cuadros no penalice el score. Si la imagen
+  fuente es totalmente opaca (sin alfa útil), su silueta se estima con el
+  color de fondo por mediana de bordes y un umbral de distancia RGB (como en
+  ``preprocess``) en vez de ``alfa > 0``.
 - ``coherence``: media de similitud con los vecinos prev/next:
   ``1 - mean(|a - b| sobre la unión de alfas) / 255``.
 - ``quality``: ``0.5 * identity + 0.5 * coherence`` recortado a [0, 1].
@@ -38,12 +44,23 @@ _HIST_CHANNELS = [0, 1, 2]
 _HIST_BINS = [16, 8, 8]
 _HIST_RANGES = [0, 180, 0, 256, 0, 256]
 
+#: Marco de píxeles usado para estimar el color de fondo de una fuente opaca.
+_SRC_BORDER_PX = 4
+#: Umbral de distancia RGB al fondo estimado (como ``preprocess.bg_threshold``).
+_SRC_BG_THRESHOLD = 30.0
 
-def _hist_and_area(rgba: np.ndarray) -> tuple[np.ndarray, int]:
-    """Histograma HSV normalizado del sujeto (alfa > 0) y área de la silueta."""
-    alpha = rgba[:, :, 3]
-    mask = np.where(alpha > 0, np.uint8(255), np.uint8(0))
-    area = int(np.count_nonzero(mask))
+
+def _hist_and_area(rgba: np.ndarray, mask: np.ndarray | None = None) -> tuple[np.ndarray, float]:
+    """Histograma HSV normalizado del sujeto y área de silueta RELATIVA.
+
+    El sujeto es ``mask`` (uint8 0/255) si se pasa; si no, ``alfa > 0``. El
+    área se devuelve como fracción del área total de la imagen (en [0, 1]),
+    para que sea comparable entre imágenes de resoluciones distintas.
+    """
+    if mask is None:
+        alpha = rgba[:, :, 3]
+        mask = np.where(alpha > 0, np.uint8(255), np.uint8(0))
+    area = float(np.count_nonzero(mask)) / float(mask.shape[0] * mask.shape[1])
     hsv = cv2.cvtColor(np.ascontiguousarray(rgba[:, :, :3]), cv2.COLOR_RGB2HSV)
     hist = cv2.calcHist([hsv], _HIST_CHANNELS, mask, _HIST_BINS, _HIST_RANGES)
     total = float(hist.sum())
@@ -60,9 +77,9 @@ def _hist_similarity(h1: np.ndarray, h2: np.ndarray) -> float:
     return float(np.clip((corr + 1.0) / 2.0, 0.0, 1.0))
 
 
-def _area_similarity(a: int, b: int) -> float:
-    """``1 - |a - b| / max(a, b, 1)``, en [0, 1]."""
-    return float(np.clip(1.0 - abs(a - b) / max(a, b, 1), 0.0, 1.0))
+def _area_similarity(a: float, b: float) -> float:
+    """``1 - |a - b| / max(a, b, eps)`` sobre fracciones de área, en [0, 1]."""
+    return float(np.clip(1.0 - abs(a - b) / max(a, b, 1e-9), 0.0, 1.0))
 
 
 def _neighbor_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -76,18 +93,49 @@ def _neighbor_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.clip(1.0 - float(diff.mean()) / 255.0, 0.0, 1.0))
 
 
+def _estimate_source_mask(rgba: np.ndarray) -> np.ndarray:
+    """Silueta estimada de una fuente OPACA: lejos del color de fondo en RGB.
+
+    El color de fondo es la mediana RGB de un marco de ``_SRC_BORDER_PX``
+    píxeles pegado a los bordes (mismo criterio que ``preprocess``); el sujeto
+    son los píxeles a distancia RGB mayor que ``_SRC_BG_THRESHOLD``.
+    """
+    h, w = rgba.shape[:2]
+    b = max(1, min(_SRC_BORDER_PX, h, w))
+    rgb = rgba[..., :3].astype(np.float32)
+    strips = [
+        rgb[:b].reshape(-1, 3),
+        rgb[-b:].reshape(-1, 3),
+        rgb[:, :b].reshape(-1, 3),
+        rgb[:, -b:].reshape(-1, 3),
+    ]
+    bg_color = np.median(np.concatenate(strips, axis=0), axis=0)
+    dist = np.linalg.norm(rgb - bg_color, axis=2)
+    return np.where(dist > _SRC_BG_THRESHOLD, np.uint8(255), np.uint8(0))
+
+
 def _pick_reference(
-    fs: FrameSet, hists: list[np.ndarray], areas: list[int]
-) -> tuple[np.ndarray, int]:
+    fs: FrameSet, hists: list[np.ndarray], areas: list[float]
+) -> tuple[np.ndarray, float]:
     """Referencia de identidad: imagen fuente si existe; si no, el cuadro cuyo
-    histograma esté más cerca de la mediana de la secuencia."""
+    histograma esté más cerca de la mediana de la secuencia.
+
+    Si la fuente es totalmente opaca (sin alfa útil), su silueta se estima con
+    el color de fondo por mediana de bordes y umbral de distancia RGB en lugar
+    de ``alfa > 0``, para no contar el fondo como sujeto. El área devuelta es
+    siempre una fracción relativa al tamaño de SU imagen (comparable entre
+    resoluciones distintas).
+    """
     src = fs.meta.get("source_image")
     if src:
         src_path = Path(src)
         if src_path.is_file():
             img = Image.open(src_path).convert("RGBA")
             rgba = np.asarray(img, dtype=np.uint8).copy()
-            return _hist_and_area(rgba)
+            mask = None
+            if bool((rgba[:, :, 3] == 255).all()):
+                mask = _estimate_source_mask(rgba)
+            return _hist_and_area(rgba, mask)
     median_hist = np.median(np.stack(hists, axis=0), axis=0).astype(np.float32)
     sims = [_hist_similarity(h, median_hist) for h in hists]
     ref_idx = int(np.argmax(sims))

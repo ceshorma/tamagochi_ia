@@ -7,11 +7,18 @@ Contrato (docs/API_SPEC.md):
   puede abrir/leer el archivo.
 - Muestreo a ``fps`` efectivo: con ``fps_video`` del contenedor se toman los
   índices ``round(k * fps_video / fps)`` únicos hasta el final del video.
+- fps efectivo y timing: con metadata de fps válida en el contenedor, el fps
+  efectivo es ``min(fps, fps_video)`` — pedir más fps que los que tiene el
+  video no puede inventar cuadros, así que el timing se deriva del muestreo
+  real: ``duration_ms = round(1000 / fps_efectivo)``. Sin metadata válida de
+  fps (0, negativa o no finita) se toman TODOS los cuadros del video y el
+  timing usa el ``fps`` pedido como suposición (``duration_ms =
+  round(1000/fps)``), porque no hay forma de saber el fps real.
 - Dedupe de consecutivos: similitud ``1 - mean(|a - b|) / 255`` sobre RGB;
   si supera ``dedupe_threshold`` se descarta el segundo cuadro.
 - Salida: PNGs RGBA (``frame_filename(i)``) + ``frameset.json`` con
-  ``stage="raw"``, ``duration_ms=round(1000/fps)`` y ``meta`` fusionado con
-  ``{"fps": fps, "video": str(video_path)}``.
+  ``stage="raw"``, ``duration_ms=round(1000/fps_efectivo)`` y ``meta``
+  fusionado con ``{"fps": fps_efectivo, "video": str(video_path)}``.
 """
 
 from __future__ import annotations
@@ -130,7 +137,15 @@ def extract_frames(
     dedupe_threshold: float = 0.995,
     meta: dict | None = None,
 ) -> FrameSet:
-    """Extrae fotogramas de ``video_path`` a un FrameSet ``raw`` en ``out_dir``."""
+    """Extrae fotogramas de ``video_path`` a un FrameSet ``raw`` en ``out_dir``.
+
+    El timing de los cuadros se deriva del fps EFECTIVO de muestreo:
+    ``min(fps, fps_video)`` cuando el contenedor reporta un fps válido (no se
+    pueden muestrear más cuadros por segundo de los que el video tiene), con
+    ``duration_ms = round(1000 / fps_efectivo)``. Si el contenedor no reporta
+    fps válido, se toman todos los cuadros y el timing usa el ``fps`` pedido
+    como suposición documentada.
+    """
     video_path = Path(video_path)
     out_dir = Path(out_dir)
     if fps <= 0:
@@ -145,6 +160,13 @@ def extract_frames(
     if not all_frames:
         raise ValueError(f"El video no contiene cuadros legibles: {video_path}")
 
+    # fps efectivo: con metadata válida no se puede muestrear por encima del
+    # fps del video (pedir más solo toma todos los cuadros una vez); sin
+    # metadata válida se toman todos los cuadros y el fps pedido es la única
+    # suposición disponible para el timing.
+    has_fps_meta = bool(fps_video) and fps_video > 0 and math.isfinite(fps_video)
+    effective_fps = min(float(fps), float(fps_video)) if has_fps_meta else float(fps)
+
     sampled = [all_frames[i] for i in _sample_indices(len(all_frames), fps_video, fps)]
 
     kept: list[np.ndarray] = []
@@ -154,7 +176,7 @@ def extract_frames(
         kept.append(rgba)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    duration_ms = round(1000 / fps)
+    duration_ms = round(1000 / effective_fps)
     frames: list[Frame] = []
     for i, rgba in enumerate(kept):
         filename = frame_filename(i)
@@ -162,7 +184,8 @@ def extract_frames(
         frames.append(Frame(index=i, file=filename, duration_ms=duration_ms))
 
     merged_meta = dict(meta or {})
-    merged_meta.update({"fps": fps, "video": str(video_path)})
+    meta_fps = int(effective_fps) if float(effective_fps).is_integer() else float(effective_fps)
+    merged_meta.update({"fps": meta_fps, "video": str(video_path)})
 
     fs = FrameSet(
         stage="raw",

@@ -21,6 +21,7 @@ Reglas para implementadores:
 
 from __future__ import annotations
 
+import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -64,15 +65,33 @@ def get_stage(name: str) -> Stage:
 
 
 def run_stage(stage: Stage, in_dir: Path, out_dir: Path, params: dict | None = None) -> FrameSet:
-    """Ejecuta una etapa: carga manifiesto, procesa, anota historial y guarda."""
+    """Ejecuta una etapa: carga manifiesto, procesa, anota historial y guarda.
+
+    La escritura es atómica respecto a ``out_dir``: se procesa hacia un dir
+    temporal hermano (``<out_dir>.tmp``) y solo tras guardar el manifiesto se
+    renombra a ``out_dir`` (reemplazando un ``out_dir`` previo si existiera).
+    Así nunca queda un stage dir parcial sin ``frameset.json`` que envenene
+    ``latest_stage_dir()``/``working_dir()``, y una etapa fallida se puede
+    reintentar sin limpieza manual.
+    """
     params = params or {}
     in_dir, out_dir = Path(in_dir), Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fs = FrameSet.load(in_dir)
-    result = stage.process(fs, in_dir, out_dir, params)
-    result = result.with_stage(stage.name, params)
-    result.reindex()
-    result.save(out_dir)
+    tmp_dir = out_dir.with_name(out_dir.name + ".tmp")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)  # restos de una corrida anterior fallida
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        fs = FrameSet.load(in_dir)
+        result = stage.process(fs, in_dir, tmp_dir, params)
+        result = result.with_stage(stage.name, params)
+        result.reindex()
+        result.save(tmp_dir)
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    tmp_dir.rename(out_dir)
     return result
 
 

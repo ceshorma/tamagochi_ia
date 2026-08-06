@@ -4,8 +4,10 @@
 máscara:
 
 - Con vecinos: el candidato es la media (float) de los cuadros vecinos y se
-  pega sobre la región con blending de borde, usando la máscara difuminada con
-  ``cv2.GaussianBlur`` como peso por píxel.
+  pega sobre la región con blending de borde. El peso por píxel es la máscara
+  difuminada con ``cv2.GaussianBlur``, forzada a 1 dentro de la región marcada
+  (``np.maximum`` con la máscara binaria): la zona blanca se regenera POR
+  COMPLETO y el feather solo suaviza hacia afuera.
 - Sin vecinos: ``cv2.inpaint`` TELEA sobre el RGB (convertido a BGR para cv2)
   y el alfa se reconstruye a partir del blur de la máscara invertida (la
   región regenerada se desvanece suavemente, sin tocar el alfa exterior).
@@ -56,8 +58,13 @@ def retouch_region(img: np.ndarray, mask: np.ndarray, neighbors: list[np.ndarray
             acc += n.astype(np.float32)
         candidate = acc / float(len(neighbors))
 
-        # Peso de blending: máscara difuminada (1 dentro, transición suave en el borde).
-        weight = cv2.GaussianBlur(binary.astype(np.float32) / 255.0, (0, 0), _BLUR_SIGMA)
+        # Peso de blending: máscara difuminada, forzada a 1 en TODA la región
+        # marcada (en máscaras delgadas el blur bajaría el peso interior muy
+        # por debajo de 1 y el defecto original se mezclaría de vuelta). El
+        # feather queda así solo hacia afuera de la región.
+        binary_f = binary.astype(np.float32) / 255.0
+        weight = cv2.GaussianBlur(binary_f, (0, 0), _BLUR_SIGMA)
+        weight = np.maximum(weight, binary_f)
         weight = np.clip(weight, 0.0, 1.0)[..., None]
         out = img.astype(np.float32) * (1.0 - weight) + candidate * weight
         return np.clip(out, 0, 255).astype(np.uint8)

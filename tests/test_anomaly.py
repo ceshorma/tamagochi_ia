@@ -171,6 +171,56 @@ def test_source_image_reference_used_when_present(tmp_path: Path):
         assert f.scores["identity"] > corrupt.scores["identity"]
 
 
+def _opaque_source_png(path: Path, size: int, bg: tuple[int, int, int]) -> None:
+    """Blob de referencia compuesto sobre un fondo OPACO casi uniforme."""
+    blob = Image.fromarray(_blob_rgba(size=size), "RGBA")
+    canvas = Image.new("RGBA", (size, size), bg + (255,))
+    canvas.alpha_composite(blob)
+    canvas.save(path)
+
+
+def test_opaque_source_at_other_resolution_not_penalized(tmp_path: Path):
+    """Fuente opaca (sin alfa útil) al DOBLE de resolución: los cuadros
+    legítimos mantienen identity alto.
+
+    Regresión: antes se comparaban áreas de silueta en píxeles absolutos entre
+    resoluciones distintas (colapsaba a ~0) y en una fuente opaca el fondo
+    entero contaba como silueta (histograma dominado por el color de fondo)."""
+    ref_path = tmp_path / "source.png"
+    _opaque_source_png(ref_path, size=2 * SIZE, bg=(235, 235, 240))
+    with Image.open(ref_path) as img:
+        assert img.convert("RGBA").getextrema()[3] == (255, 255)  # opaca
+
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    _build_frameset(in_dir, meta={"source_image": str(ref_path)})  # secuencia limpia
+
+    result = run_stage(AnomalyStage(), in_dir, out_dir)
+
+    assert result.meta["anomaly_summary"]["flagged"] == 0
+    for f in result.frames:
+        assert f.scores["identity"] > 0.8
+        assert "anomaly" not in f.flags
+
+
+def test_opaque_source_still_discriminates_corrupt_frame(tmp_path: Path):
+    """Con fuente opaca a otra resolución, el cuadro corrupto sigue teniendo
+    identity menor que todos los cuadros limpios."""
+    ref_path = tmp_path / "source.png"
+    _opaque_source_png(ref_path, size=2 * SIZE, bg=(235, 235, 240))
+
+    in_dir, out_dir = tmp_path / "in", tmp_path / "out"
+    _build_frameset(in_dir, corrupt_index=CORRUPT_INDEX, meta={"source_image": str(ref_path)})
+
+    result = run_stage(AnomalyStage(), in_dir, out_dir)
+
+    corrupt = result.frames[CORRUPT_INDEX]
+    assert "anomaly" in corrupt.flags
+    for f in result.frames:
+        if f.index != CORRUPT_INDEX:
+            assert "anomaly" not in f.flags
+            assert f.scores["identity"] > corrupt.scores["identity"]
+
+
 def test_custom_threshold_param(tmp_path: Path):
     in_dir, out_dir = tmp_path / "in", tmp_path / "out"
     _build_frameset(in_dir)  # secuencia limpia

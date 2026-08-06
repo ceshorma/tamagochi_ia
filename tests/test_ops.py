@@ -341,6 +341,80 @@ def test_apply_edit_indice_fuera_de_rango(anim: Paths):
     assert anim.list_edit_versions() == [1]
 
 
+def test_ensure_edit_session_fuente_sin_manifiesto_no_crea_version(data_dir: Path):
+    """Con solo un stage dir parcial (sin frameset.json) el error es claro y
+    NO queda ninguna versión basura en edits/."""
+    paths = Paths("p", "parcial", data_dir=data_dir)
+    partial = paths.stages_dir / "03_align"
+    partial.mkdir(parents=True)
+    save_frame_rgba(partial, frame_filename(0), circle_frame(30))  # PNG sin manifiesto
+
+    with pytest.raises(FileNotFoundError):
+        ensure_edit_session(paths)
+
+    assert paths.list_edit_versions() == []
+    assert not paths.edits_dir.exists() or not any(paths.edits_dir.iterdir())
+
+
+def test_ensure_edit_session_salta_stage_parcial(anim: Paths):
+    """Un stage dir más avanzado pero parcial se salta: la sesión se crea desde
+    la última etapa COMPLETA."""
+    partial = anim.stages_dir / "06_extra"
+    partial.mkdir(parents=True)
+    (partial / "frame_0000.png").write_bytes(b"parcial, sin manifiesto")
+
+    d1 = ensure_edit_session(anim)
+
+    assert d1 == anim.edit_dir(1)
+    assert (d1 / "frameset.json").exists()
+    assert FrameSet.load(d1).stage == "smooth"  # copiado de 05_smooth, no del parcial
+    assert png_names(d1) == [frame_filename(i) for i in range(4)]
+
+
+def test_apply_edit_concurrente_historial_consistente(anim: Paths):
+    """4 hilos aplicando ediciones a la vez sobre la misma animación: sin
+    excepciones y con historial secuencial de versiones, todas válidas."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    n_threads = 4
+    barrier = threading.Barrier(n_threads)
+
+    def worker(_i: int):
+        barrier.wait()
+        return apply_edit(anim, {"op": "duplicate", "index": 0})
+
+    with ThreadPoolExecutor(max_workers=n_threads) as ex:
+        results = list(ex.map(worker, range(n_threads)))  # re-lanza excepciones
+
+    assert len(results) == n_threads
+    # Sesión (edit_0001) + una versión por edición, sin huecos ni colisiones.
+    assert anim.list_edit_versions() == [1, 2, 3, 4, 5]
+    # Todos los manifiestos cargan y cada versión añade exactamente un cuadro.
+    counts = [len(FrameSet.load(anim.edit_dir(v)).frames) for v in [1, 2, 3, 4, 5]]
+    assert counts == [4, 5, 6, 7, 8]
+    # No quedaron dirs temporales ni basura en edits/.
+    names = sorted(d.name for d in anim.edits_dir.iterdir())
+    assert names == [f"edit_{v:04d}" for v in range(1, 6)]
+
+
+def test_undo_ignora_versiones_invalidas_y_no_reutiliza_numeros(anim: Paths):
+    apply_edit(anim, {"op": "delete", "index": 0})  # crea edit_0001 y edit_0002
+    garbage = anim.edits_dir / "edit_0007"
+    garbage.mkdir()
+    (garbage / "frame_0000.png").write_bytes(b"basura sin manifiesto")
+
+    fs = undo(anim)  # deshace edit_0002; la basura no cuenta como versión
+    assert fs is not None and len(fs.frames) == 4
+    assert anim.list_edit_versions() == [1]
+    assert garbage.exists()
+
+    # La siguiente edición NO colisiona con el número de la basura.
+    apply_edit(anim, {"op": "duplicate", "index": 0})
+    assert anim.list_edit_versions() == [1, 8]
+    assert (anim.edit_dir(8) / "frameset.json").exists()
+
+
 def test_undo(anim: Paths):
     assert undo(anim) is None  # sin ediciones no hay nada que deshacer
     ensure_edit_session(anim)

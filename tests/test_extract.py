@@ -136,4 +136,52 @@ def test_fps_above_video_fps_takes_all_frames_once(video_path: Path, tmp_path: P
 
     # Índices round(k * 10 / 12) únicos cubren los 15 cuadros sin repetirlos.
     assert len(fs.frames) == N_TOTAL
+    # El timing refleja el fps EFECTIVO de muestreo min(12, 10) = 10, no el
+    # pedido: no se pueden muestrear más cuadros de los que el video tiene.
+    assert all(f.duration_ms == 100 for f in fs.frames)  # round(1000 / 10)
+    assert fs.meta["fps"] == FPS_VIDEO
+
+
+@pytest.fixture(scope="module")
+def video_8fps_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("video8") / "synthetic_8fps.mp4"
+    imageio.mimwrite(str(path), _video_frames(), fps=8, macro_block_size=1, quality=8)
+    return path
+
+
+def test_fps_24_over_8fps_video_keeps_real_timing(video_8fps_path: Path, tmp_path: Path):
+    """Pedir fps=24 sobre un video de 8 fps toma todos los cuadros una vez y
+    el timing usa el fps efectivo min(24, 8) = 8: duration_ms = 125.
+
+    Regresión: antes duration_ms = round(1000/24) = 42, reproduciendo la
+    animación 3x más rápida que el video fuente."""
+    out = tmp_path / "raw"
+    fs = extract_frames(video_8fps_path, out, fps=24, dedupe_threshold=1.5)
+
+    assert len(fs.frames) == N_TOTAL  # todos los cuadros, una sola vez
+    assert all(f.duration_ms == 125 for f in fs.frames)  # round(1000 / 8)
+    assert fs.meta["fps"] == 8
+
+
+def test_no_fps_metadata_takes_all_frames_with_requested_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Sin metadata válida de fps: se toman TODOS los cuadros y el timing usa
+    el fps pedido como suposición (documentado en extract_frames)."""
+    rgba_frames = [
+        np.dstack([_unique_frame(i), np.full((SIZE, SIZE, 1), 255, np.uint8)])
+        for i in range(6)
+    ]
+    # El lector reporta fps_video = 0.0 (contenedor sin metadata de fps).
+    monkeypatch.setattr(
+        "sprite_pipeline.extract._read_with_cv2", lambda path: (rgba_frames, 0.0)
+    )
+    video = tmp_path / "no_meta.mp4"
+    video.write_bytes(b"stub")
+
+    out = tmp_path / "raw"
+    fs = extract_frames(video, out, fps=12, dedupe_threshold=1.5)
+
+    assert len(fs.frames) == 6  # todos los cuadros del video
     assert all(f.duration_ms == 83 for f in fs.frames)  # round(1000 / 12)
+    assert fs.meta["fps"] == 12

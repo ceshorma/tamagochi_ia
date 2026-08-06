@@ -14,7 +14,7 @@ Estados de job: queued -> running -> succeeded | failed.
 from __future__ import annotations
 
 import shutil
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from sprite_pipeline.config import get_settings
@@ -39,26 +39,28 @@ def run_animation_pipeline(
 ) -> dict:
     """Corre el pipeline completo de forma síncrona. Devuelve la fila final.
 
-    Ante cualquier excepción marca la animación (y el job) como ``failed`` con
-    el mensaje en ``error`` y re-lanza solo si ``params.get("raise_errors")``.
+    Ante cualquier excepción —en CUALQUIER punto, incluida la resolución de la
+    animación— marca la animación y el job como ``failed`` con el mensaje en
+    ``error`` (el job nunca queda huérfano en queued/running) y re-lanza solo
+    si ``params.get("raise_errors")``.
     """
     params = dict(params or {})
-    anim = store.get_animation(animation_id)
-    if anim is None:
-        raise KeyError(f"Animación desconocida: {animation_id!r}")
-
-    settings = get_settings()
-    paths = Paths(anim["project_id"], animation_id)
     job_id = params.get("job_id")
-    total_steps = len(PIPELINE_ORDER) + 2  # generación+extracción, etapas, cierre
 
     def _job(**fields) -> None:
         if job_id:
             store.update_job(job_id, **fields)
 
     try:
-        if job_id:
-            _job(status="running", progress=0.0)
+        anim = store.get_animation(animation_id)
+        if anim is None:
+            raise KeyError(f"Animación desconocida: {animation_id!r}")
+
+        settings = get_settings()
+        paths = Paths(anim["project_id"], animation_id)
+        total_steps = len(PIPELINE_ORDER) + 2  # generación+extracción, etapas, cierre
+
+        _job(status="running", progress=0.0)
 
         # 1. Imagen fuente al layout de la animación.
         image_path = Path(image_path)
@@ -111,8 +113,16 @@ def run_animation_pipeline(
         store.update_animation(animation_id, status="ready", error=None)
         _job(status="succeeded", progress=1.0)
     except Exception as exc:  # noqa: BLE001 - el estado failed debe registrarse siempre
-        store.update_animation(animation_id, status="failed", error=str(exc))
-        _job(status="failed", error=str(exc))
+        error = str(exc)
+        # El job debe terminar SIEMPRE (failed), aunque el otro update falle.
+        try:
+            _job(status="failed", error=error)
+        except Exception:  # noqa: BLE001 - no enmascarar la excepción original
+            pass
+        try:
+            store.update_animation(animation_id, status="failed", error=error)
+        except Exception:  # noqa: BLE001
+            pass
         if params.get("raise_errors"):
             raise
     return store.get_animation(animation_id)
@@ -124,14 +134,58 @@ class Orchestrator:
     def __init__(self, store: Store):
         self.store = store
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sprite-pipeline")
+        #: Future de cada job en vuelo, keyed por job_id (no se descartan).
+        self._futures: dict[str, Future] = {}
 
     def submit_generation(self, animation_id: str, image_path: Path, params: dict | None = None) -> dict:
         """Crea el job ``kind="pipeline"``, encola la ejecución y devuelve el job."""
         params = dict(params or {})
         job = self.store.create_job(animation_id, kind="pipeline")
-        params["job_id"] = job["id"]
-        self.executor.submit(run_animation_pipeline, self.store, animation_id, Path(image_path), params)
+        job_id = job["id"]
+        params["job_id"] = job_id
+        future = self.executor.submit(
+            run_animation_pipeline, self.store, animation_id, Path(image_path), params
+        )
+        self._futures[job_id] = future
+
+        def _on_done(fut: Future, jid: str = job_id) -> None:
+            self._futures.pop(jid, None)
+            exc = fut.exception()
+            if exc is None:
+                return
+            # Red de seguridad: run_animation_pipeline ya marca failed, pero si
+            # algo escapó del worker el job no debe quedar en queued/running.
+            try:
+                current = self.store.get_job(jid)
+                if current and current["status"] not in ("succeeded", "failed"):
+                    self.store.update_job(jid, status="failed", error=str(exc))
+                    self.store.update_animation(animation_id, status="failed", error=str(exc))
+            except Exception:  # noqa: BLE001 - un callback no debe lanzar
+                pass
+
+        future.add_done_callback(_on_done)
         return job
+
+
+STALE_JOB_ERROR = "proceso reiniciado o job huérfano"
+
+
+def reconcile_stale_jobs(store: Store) -> int:
+    """Marca como ``failed`` los jobs colgados en ``queued``/``running``.
+
+    El executor vive solo en memoria: tras un reinicio del proceso (o si el
+    worker murió sin registrar estado) ningún job ``queued``/``running`` puede
+    completarse ya. Pensada para llamarse al arrancar la API. Las animaciones
+    asociadas que quedaron en ``generating``/``processing`` también pasan a
+    ``failed``. Devuelve cuántos jobs se reconciliaron.
+    """
+    stale = store.list_unfinished_jobs()
+    for job in stale:
+        store.update_job(job["id"], status="failed", error=STALE_JOB_ERROR)
+        anim = store.get_animation(job["animation_id"])
+        if anim is not None and anim["status"] in ("generating", "processing"):
+            store.update_animation(anim["id"], status="failed", error=STALE_JOB_ERROR)
+    return len(stale)
 
 
 #: Singleton por proceso: una instancia de Orchestrator por Store.
