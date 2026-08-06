@@ -1,0 +1,36 @@
+[project]
+name = "sprite-pipeline"
+version = "0.1.0"
+description = "AI Sprite Pipeline: convierte una imagen en un sprite animado listo para videojuegos"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "Pillow",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "imageio",
+    "imageio-ffmpeg",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+sprite-pipeline = "sprite_pipeline.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sprite_pipeline*"]
+
+[tool.setuptools.package-data]
+sprite_pipeline = ["editor/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
